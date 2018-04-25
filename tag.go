@@ -6,55 +6,121 @@ import (
 )
 
 const (
-	tagCli    = "cli"
+	tagCli  = "cli"
+	tagPw   = "pw" // password
+	tagEdit = "edit"
+
 	tagUsage  = "usage"
 	tagDefaut = "dft"
 	tagName   = "name"
-	tagPw     = "pw" // password
 	tagPrompt = "prompt"
+	tagParser = "parser"
+	tagSep    = "sep" // used to seperate key/value pair of map, default is `=`
 
 	dashOne = "-"
 	dashTwo = "--"
 
 	sepName = ", "
+
+	defaultSepForKeyValueOfMap = "="
 )
 
-type fieldTag struct {
-	required     bool
-	shortNames   []string
-	longNames    []string
-	usage        string
-	defaultValue string
-	name         string
-	prompt       string
-	isPassword   bool
+type tagProperty struct {
+	// is a required flag?
+	isRequired bool `cli:"*x" pw:"*y" edit:"*z"`
 
-	isHelp bool
+	// is a force flag?
+	isForce bool `cli:"!x" pw:"!y" edit:"!z"`
+
+	// is a password flag?
+	isPassword bool `pw:"xxx"`
+
+	// is a edit flag?
+	isEdit   bool   `edit:"xxx"`
+	editFile string `edit:"FILE:xxx"`
+
+	usage         string            `usage:"usage string"`
+	dft           string            `dft:"default value or expression"`
+	name          string            `name:"tag reference name"`
+	prompt        string            `prompt:"prompt string"`
+	sep           string            `sep:"string for seperate kay/value pair of map"`
+	parserCreator FlagParserCreator `parser:"parser for flag"`
+
+	// flag names
+	shortNames []string
+	longNames  []string
 }
 
-func parseTag(fieldName string, tag reflect.StructTag) (*fieldTag, bool) {
-	ftag := &fieldTag{
+func parseTag(fieldName string, tag reflect.StructTag) (p *tagProperty, isEmpty bool, err error) {
+	p = &tagProperty{
 		shortNames: []string{},
 		longNames:  []string{},
 	}
+	cliLikeTagCount := 0
+
+	// `cli` TAG
 	cli := tag.Get(tagCli)
-	pw := tag.Get(tagPw)
-	if pw != "" {
-		ftag.isPassword = true
-		cli = pw
+	if cli != "" {
+		cliLikeTagCount++
 	}
-	ftag.usage = tag.Get(tagUsage)
-	ftag.defaultValue = tag.Get(tagDefaut)
-	ftag.name = tag.Get(tagName)
-	ftag.prompt = tag.Get(tagPrompt)
+
+	// `pw` TAG
+	if pw := tag.Get(tagPw); pw != "" {
+		p.isPassword = true
+		cli = pw
+		cliLikeTagCount++
+	}
+
+	// `edit` TAG
+	if edit := tag.Get(tagEdit); edit != "" {
+		// specific filename for editor
+		sepIndex := strings.Index(edit, ":")
+		if sepIndex > 0 {
+			p.editFile = edit[:sepIndex]
+			edit = edit[sepIndex+1:]
+		}
+		p.isEdit = true
+		cli = edit
+		cliLikeTagCount++
+	}
+
+	if cliLikeTagCount > 1 {
+		err = errCliTagTooMany
+		return
+	}
+
+	// `usage` TAG
+	p.usage = tag.Get(tagUsage)
+
+	// `dft` TAG
+	p.dft = tag.Get(tagDefaut)
+
+	// `name` TAG
+	p.name = tag.Get(tagName)
+
+	// `prompt` TAG
+	p.prompt = tag.Get(tagPrompt)
+
+	// `parser` TAG
+	if parserName := tag.Get(tagParser); parserName != "" {
+		if parserCreator, ok := parserCreators[parserName]; ok {
+			p.parserCreator = parserCreator
+		}
+	}
+
+	// `sep` TAG
+	p.sep = defaultSepForKeyValueOfMap
+	if sep := tag.Get(tagSep); sep != "" {
+		p.sep = sep
+	}
 
 	cli = strings.TrimSpace(cli)
 	for {
 		if strings.HasPrefix(cli, "*") {
-			ftag.required = true
+			p.isRequired = true
 			cli = strings.TrimSpace(strings.TrimPrefix(cli, "*"))
 		} else if strings.HasPrefix(cli, "!") {
-			ftag.isHelp = true
+			p.isForce = true
 			cli = strings.TrimSpace(strings.TrimPrefix(cli, "!"))
 		} else {
 			break
@@ -62,22 +128,22 @@ func parseTag(fieldName string, tag reflect.StructTag) (*fieldTag, bool) {
 	}
 
 	names := strings.Split(cli, ",")
-	isEmpty := true
+	isEmpty = true
 	for _, name := range names {
 		if name = strings.TrimSpace(name); name == dashOne {
-			return nil, false
+			return nil, false, nil
 		}
 		if len(name) == 0 {
 			continue
 		} else if len(name) == 1 {
-			ftag.shortNames = append(ftag.shortNames, dashOne+name)
+			p.shortNames = append(p.shortNames, dashOne+name)
 		} else {
-			ftag.longNames = append(ftag.longNames, dashTwo+name)
+			p.longNames = append(p.longNames, dashTwo+name)
 		}
 		isEmpty = false
 	}
 	if isEmpty {
-		ftag.longNames = append(ftag.longNames, dashTwo+fieldName)
+		p.longNames = append(p.longNames, dashTwo+fieldName)
 	}
-	return ftag, isEmpty
+	return
 }

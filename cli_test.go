@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -8,7 +10,32 @@ import (
 	"testing"
 
 	"github.com/labstack/gommon/color"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+var donothing = func(*Context) error { return nil }
+
+func TestTree(t *testing.T) {
+	cmd := &Command{Name: "cmd", Fn: donothing}
+	subcmd := &Command{Name: "subcmd", Fn: donothing}
+
+	tree := Tree(cmd, Tree(subcmd))
+	assert.Equal(t, tree.command.Name, "cmd")
+	require.Len(t, tree.forest, 1)
+	assert.Equal(t, tree.forest[0].command.Name, "subcmd")
+	assert.Len(t, tree.forest[0].forest, 0)
+}
+
+func TestRoot(t *testing.T) {
+	donothing := func(*Context) error { return nil }
+	root := Root(&Command{Name: "cmd", Fn: donothing},
+		Tree(&Command{Name: "subcmd", Fn: donothing}),
+	)
+	assert.Equal(t, root.Name, "cmd")
+	require.Len(t, root.children, 1)
+	assert.Equal(t, root.children[0].Name, "subcmd")
+}
 
 type argT struct {
 	Short         bool   `cli:"s" usage:"short flag"`
@@ -329,17 +356,17 @@ func TestParse(t *testing.T) {
 	if flagSet := parseArgv([]string{}, argT{}, clr); flagSet.err != errNotAPointer {
 		t.Errorf("want %v, got %v", errNotAPointer, flagSet.err)
 	}
-	if usage(argT{}, clr, NormalStyle) != "" {
+	if usage([]interface{}{argT{}}, clr, NormalStyle) != "" {
 		t.Errorf("want usage empty, but not")
 	}
 
 	//Case parse pointer, but not indirect a struct
 	tmp := 0
 	ptrInt := &tmp
-	if flagSet := parseArgv([]string{}, ptrInt, clr); flagSet.err != errNotPointToStruct {
-		t.Errorf("want %v, got %v", errNotPointToStruct, flagSet.err)
+	if flagSet := parseArgv([]string{}, ptrInt, clr); flagSet.err != errNotAPointerToStruct {
+		t.Errorf("want %v, got %v", errNotAPointerToStruct, flagSet.err)
 	}
-	if usage(ptrInt, clr, NormalStyle) != "" {
+	if usage([]interface{}{ptrInt}, clr, NormalStyle) != "" {
 		t.Errorf("want usage empty, but not")
 	}
 
@@ -351,7 +378,7 @@ func TestParse(t *testing.T) {
 	if flagSet := parseArgv([]string{}, new(tmpT), clr); flagSet.err == nil {
 		t.Errorf("want error, got nil")
 	}
-	if usage(new(tmpT), clr, NormalStyle) != "" {
+	if usage([]interface{}{new(tmpT)}, clr, NormalStyle) != "" {
 		t.Errorf("want usage empty, but not")
 	}
 
@@ -370,30 +397,86 @@ func TestParse(t *testing.T) {
 
 func TestUsage(t *testing.T) {
 	clr := color.Color{}
-	usage := usage(new(argT), clr, NormalStyle)
+	clr.Disable()
+	got := usage([]interface{}{new(argT)}, clr, NormalStyle)
 	want := fmt.Sprintf(
-		`      -s                             short flag
-      -2                             another short flag
-      -S, --long                     short and long flags
-  -x, -y, --abcd, --omitof           many short and long flags
-          --long-flag                long flag
-          --required                %srequired flag, note the *
-          --dft, --default%s     default value
-          --UnName                   unname field
-          --i8                       type int8
-          --u8                       type uint8
-          --i16                      type int16
-          --u16                      type uint16
-          --i32                      type int32
-          --u32                      type uint32
-          --i64                      type int64
-          --u64                      type uint64
-          --f32                      type float32
-          --f64                      type float64
-`, clr.Red("*"), clr.Grey("[=102]"))
-	if usage != want {
-		t.Errorf("usage want `%s`, got `%s`", want, usage)
-	}
+		`      -s                           short flag
+      -2                           another short flag
+      -S, --long                   short and long flags
+  -x, -y, --abcd, --omitof         many short and long flags
+          --long-flag              long flag
+          --required              *required flag, note the *
+          --dft, --default[=102]   default value
+          --UnName                 unname field
+          --i8                     type int8
+          --u8                     type uint8
+          --i16                    type int16
+          --u16                    type uint16
+          --i32                    type int32
+          --u32                    type uint32
+          --i64                    type int64
+          --u64                    type uint64
+          --f32                    type float32
+          --f64                    type float64
+`)
+	assert.Equal(t, got, want)
+
+	got = usage([]interface{}{new(argT)}, clr, ManualStyle)
+	want = `  -s
+      short flag
+
+  -2
+      another short flag
+
+  -S, --long
+      short and long flags
+
+  -x, -y, --abcd, --omitof
+      many short and long flags
+
+  --long-flag
+      long flag
+
+  --required
+      *required flag, note the *
+
+  --dft, --default[=102]
+      default value
+
+  --UnName
+      unname field
+
+  --i8
+      type int8
+
+  --u8
+      type uint8
+
+  --i16
+      type int16
+
+  --u16
+      type uint16
+
+  --i32
+      type int32
+
+  --u32
+      type uint32
+
+  --i64
+      type int64
+
+  --u64
+      type uint64
+
+  --f32
+      type float32
+
+  --f64
+      type float64
+`
+	assert.Equal(t, got, want)
 }
 
 func TestStructField(t *testing.T) {
@@ -517,10 +600,6 @@ func TestSliceAndMap(t *testing.T) {
 			}},
 		},
 		{
-			args:  []string{"-m=2=s"},
-			isErr: true,
-		},
-		{
 			args:  []string{"-m"},
 			isErr: true,
 		},
@@ -533,7 +612,7 @@ func TestSliceAndMap(t *testing.T) {
 		flagSet := parseArgv(tab.args, v, clr)
 		if tab.isErr {
 			if flagSet.err == nil {
-				t.Errorf("want error, but not")
+				t.Errorf("want error, but not. tab=%v", tab)
 			}
 			continue
 		}
@@ -578,4 +657,73 @@ func TestErrorMapType(t *testing.T) {
 	if flagSet.err == nil {
 		t.Errorf("want error, but not")
 	}
+}
+
+func TestIsSet(t *testing.T) {
+	type argT struct {
+		A int `cli:"a,aa" dft:"1"`
+		B int `cli:"b"`
+	}
+	for i, tt := range []struct {
+		args   []string
+		isSetA bool
+		isSetB bool
+	}{
+		{[]string{"app", "-a=1", "-b=1"}, true, true},
+		{[]string{"app", "--aa=1", "-b=1"}, true, true},
+		{[]string{"app", "-a=1"}, true, false},
+		{[]string{"app", "-b=1"}, false, true},
+		{[]string{"app"}, false, false},
+	} {
+		RunWithArgs(new(argT), tt.args, func(ctx *Context) error {
+			assert.Equal(t, ctx.IsSet("-a"), tt.isSetA, "case %d", i)
+			assert.Equal(t, ctx.IsSet("-a", "--aa"), tt.isSetA, "case %d", i)
+			assert.Equal(t, ctx.IsSet("-b"), tt.isSetB, "case %d", i)
+			return nil
+		})
+	}
+}
+
+func TestHelpCommand(t *testing.T) {
+	w := bytes.NewBufferString("")
+	root := &Command{Name: "root"}
+	help := HelpCommand("help command")
+	root.Register(help)
+	assert.Nil(t, root.RunWith([]string{"help"}, w, nil))
+	assert.Equal(t, w.String(), "Commands:\n\n  help   help command\n")
+	assert.Error(t, root.RunWith([]string{"help", "not-found"}, nil, nil))
+}
+
+func TestError(t *testing.T) {
+	assert.Equal(t, ExitError.Error(), "exit")
+	assert.Equal(t, throwCommandNotFound("cmd").Error(), "command cmd not found")
+	assert.Equal(t, throwMethodNotAllowed("POST").Error(), "method POST not allowed")
+	assert.Equal(t, throwRouterRepeat("R").Error(), "router R repeat")
+	clr := color.Color{}
+	clr.Disable()
+	assert.Equal(t, wrapErr(throwCommandNotFound("cmd"), "_end", clr).Error(), `ERR! command cmd not found_end`)
+
+	assert.Equal(t, argvError{isEmpty: true}.Error(), "argv list is empty")
+	assert.Equal(t, argvError{isOutOfRange: true}.Error(), "argv list out of range")
+	assert.Equal(t, argvError{ith: 1, msg: "ERROR MSG"}.Error(), "1th argv: ERROR MSG")
+}
+
+type customT struct {
+	K1 string
+	K2 int
+}
+
+func (t *customT) Decode(s string) error {
+	return json.Unmarshal([]byte(s), t)
+}
+
+func TestDecoder(t *testing.T) {
+	type argT struct {
+		D customT `cli:"d"`
+	}
+	v := new(argT)
+	clr := color.Color{}
+	flagSet := parseArgv([]string{`-d`, `{"k1": "string", "k2": 2}`}, v, clr)
+	assert.Nil(t, flagSet.err)
+	assert.Equal(t, v.D, customT{K1: "string", K2: 2})
 }

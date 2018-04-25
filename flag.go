@@ -4,116 +4,176 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"math"
-	"net/url"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
 
-	"github.com/Bowery/prompt"
 	"github.com/labstack/gommon/color"
+	"github.com/mkideal/pkg/expr"
 )
 
-type flagSet struct {
-	err    error
-	values url.Values
-	args   []string
-
-	flagMap map[string]*flag
-	flags   []*flag
-
-	dontValidate bool
-}
-
-func newFlagSet() *flagSet {
-	return &flagSet{
-		flagMap: make(map[string]*flag),
-		flags:   []*flag{},
-		values:  url.Values(make(map[string][]string)),
-		args:    make([]string, 0),
-	}
-}
-
-func (fs *flagSet) readPrompt(w io.Writer, clr color.Color) {
-	for _, fl := range fs.flags {
-		if fl.assigned || fl.tag.prompt == "" {
-			continue
-		}
-		// read ...
-		prefix := fl.tag.prompt + ": "
-		var (
-			data string
-			yes  bool
-		)
-		if fl.tag.isPassword {
-			data, fs.err = prompt.Password(prefix)
-			if fs.err == nil && data != "" {
-				fl.set(data, data, clr)
-			}
-		} else if fl.isBoolean() {
-			yes, fs.err = prompt.Ask(prefix)
-			if fs.err == nil {
-				fl.v.SetBool(yes)
-			}
-		} else if fl.tag.defaultValue != "" {
-			data, fs.err = prompt.BasicDefault(prefix, fl.tag.defaultValue)
-			if fs.err == nil {
-				fl.set(data, data, clr)
-			}
-		} else {
-			data, fs.err = prompt.Basic(prefix, fl.tag.required)
-			if fs.err == nil {
-				fl.set(data, data, clr)
-			}
-		}
-		if fs.err != nil {
-			return
-		}
-	}
-}
-
 type flag struct {
-	t reflect.StructField
-	v reflect.Value
+	field reflect.StructField
+	value reflect.Value
 
-	assigned bool
-	tag      fieldTag
+	// isAssigned indicates whether the flag is set(contains default value)
+	isAssigned bool
 
-	actual string
+	// isSet indicates whether the flag is set
+	isSet bool
+
+	// tag properties
+	tag tagProperty
+
+	// actual flag name
+	actualFlagName string
+
+	isNeedDelaySet bool
+
+	// last value for need delay set
+	// flag maybe assigned too many times, like:
+	//	-f xx -f yy -f zz
+	// `zz` is the last value
+	lastValue string
 }
 
-func newFlag(t reflect.StructField, v reflect.Value, tag *fieldTag, clr color.Color) (fl *flag, err error) {
-	fl = &flag{t: t, v: v}
-	if !fl.v.CanSet() {
-		return nil, fmt.Errorf("field %s can not set", clr.Bold(fl.t.Name))
+func newFlag(field reflect.StructField, value reflect.Value, tag *tagProperty, clr color.Color, dontSetValue bool) (fl *flag, err error) {
+	fl = &flag{field: field, value: value}
+	if !fl.value.CanSet() {
+		return nil, fmt.Errorf("field %s can not set", clr.Bold(fl.field.Name))
 	}
 	fl.tag = *tag
-	err = fl.init(clr)
+	if fl.isPtr() && fl.value.IsNil() {
+		fl.value.Set(reflect.New(fl.field.Type.Elem()))
+	}
+	isSliceDecoder := fl.value.Type().Implements(reflect.TypeOf((*SliceDecoder)(nil)).Elem())
+	if !isSliceDecoder && fl.value.CanAddr() {
+		isSliceDecoder = fl.value.Addr().Type().Implements(reflect.TypeOf((*SliceDecoder)(nil)).Elem())
+	}
+	fl.isNeedDelaySet = fl.tag.parserCreator != nil ||
+		(fl.field.Type.Kind() != reflect.Slice && fl.field.Type.Kind() != reflect.Map && !isSliceDecoder)
+	err = fl.init(clr, dontSetValue)
 	return
 }
 
-func (fl *flag) init(clr color.Color) error {
-	dft := fl.tag.defaultValue
-	if strings.HasPrefix(dft, "$") {
-		dft = dft[1:]
-		if !strings.HasPrefix(dft, "$") {
-			dft = os.Getenv(dft)
+func (fl *flag) init(clr color.Color, dontSetValue bool) error {
+	var (
+		isNumber  = fl.isInteger() || fl.isFloat()
+		isDecoder = fl.value.Type().Implements(reflect.TypeOf((*Decoder)(nil)).Elem())
+		dft       string
+		err       error
+	)
+	if !isDecoder && fl.value.CanAddr() {
+		isDecoder = fl.value.Addr().Type().Implements(reflect.TypeOf((*Decoder)(nil)).Elem())
+	}
+	dft, err = parseExpression(fl.tag.dft, isNumber)
+	if err != nil {
+		return err
+	}
+	if isNumber && !isDecoder {
+		v, err := expr.Eval(dft, nil, nil)
+		if err == nil {
+			if fl.isInteger() {
+				dft = fmt.Sprintf("%d", v.Int())
+			} else if fl.isFloat() {
+				dft = fmt.Sprintf("%f", v.Float())
+			}
 		}
 	}
-	if dft != "" {
-		zero := reflect.Zero(fl.t.Type)
-		if reflect.DeepEqual(zero.Interface(), fl.v.Interface()) {
-			return fl.set("", dft, clr)
+	if !dontSetValue && fl.tag.dft != "" && dft != "" {
+		if fl.isPtr() || isDecoder || isEmpty(fl.value) {
+			return fl.setDefault(dft, clr)
 		}
 	}
 	return nil
 }
 
+func isEmpty(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Array, reflect.Map, reflect.Slice, reflect.String:
+		return v.Len() == 0
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Ptr:
+		return v.IsNil()
+	}
+	return false
+}
+
+func isWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') ||
+		(b >= 'A' && b <= 'Z') ||
+		(b >= '0' && b <= '9') ||
+		b == '_'
+}
+
+func parseExpression(s string, isNumber bool) (string, error) {
+	const escapeByte = '$'
+	var (
+		src       = []byte(s)
+		escaping  = false
+		exprBuf   bytes.Buffer
+		envvarBuf bytes.Buffer
+	)
+	writeEnv := func(envName string) error {
+		if envName == "" {
+			return fmt.Errorf("unexpected end after %v", escapeByte)
+		}
+		env := os.Getenv(envName)
+		if env == "" && isNumber {
+			env = "0"
+		}
+		exprBuf.WriteString(env)
+		return nil
+	}
+	for i, b := range src {
+		if b == escapeByte {
+			if escaping && envvarBuf.Len() == 0 {
+				exprBuf.WriteByte(b)
+				escaping = false
+			} else {
+				escaping = true
+				if i+1 == len(src) {
+					return "", fmt.Errorf("unexpected end after %v", escapeByte)
+				}
+				envvarBuf.Reset()
+			}
+			continue
+		}
+		if escaping {
+			if isWordByte(b) {
+				envvarBuf.WriteByte(b)
+				if i+1 == len(src) {
+					if err := writeEnv(envvarBuf.String()); err != nil {
+						return "", err
+					}
+				}
+			} else {
+				if err := writeEnv(envvarBuf.String()); err != nil {
+					return "", err
+				}
+				exprBuf.WriteByte(b)
+				envvarBuf.Reset()
+				escaping = false
+			}
+		} else {
+			exprBuf.WriteByte(b)
+		}
+	}
+	return exprBuf.String(), nil
+}
+
 func (fl *flag) name() string {
-	if fl.actual != "" {
-		return fl.actual
+	if fl.actualFlagName != "" {
+		return fl.actualFlagName
 	}
 	if len(fl.tag.longNames) > 0 {
 		return fl.tag.longNames[0]
@@ -125,24 +185,127 @@ func (fl *flag) name() string {
 }
 
 func (fl *flag) isBoolean() bool {
-	return fl.t.Type.Kind() == reflect.Bool
+	return fl.field.Type.Kind() == reflect.Bool
+}
+
+func (fl *flag) isInteger() bool {
+	switch fl.field.Type.Kind() {
+	case reflect.Int,
+		reflect.Int8,
+		reflect.Int16,
+		reflect.Int32,
+		reflect.Int64,
+		reflect.Uint,
+		reflect.Uint8,
+		reflect.Uint16,
+		reflect.Uint32,
+		reflect.Uint64:
+		return true
+	}
+	return false
+}
+
+func (fl *flag) isSlice() bool {
+	return fl.field.Type.Kind() == reflect.Slice
+}
+
+func (fl *flag) isMap() bool {
+	return fl.field.Type.Kind() == reflect.Map
+}
+
+func (fl *flag) isFloat() bool {
+	kind := fl.field.Type.Kind()
+	return kind == reflect.Float32 || kind == reflect.Float64
+}
+
+func (fl *flag) isString() bool {
+	return fl.field.Type.Kind() == reflect.String
+}
+
+func (fl *flag) isPtr() bool {
+	return fl.field.Type.Kind() == reflect.Ptr
 }
 
 func (fl *flag) getBool() bool {
 	if !fl.isBoolean() {
 		return false
 	}
-	return fl.v.Bool()
+	return fl.value.Bool()
 }
 
-func (fl *flag) set(actual, s string, clr color.Color) error {
-	fl.assigned = true
-	fl.actual = actual
-	return setWithProperType(fl.t.Type, fl.v, s, clr, false)
+func (fl *flag) setDefault(s string, clr color.Color) error {
+	fl.isAssigned = true
+	if fl.isNeedDelaySet {
+		fl.lastValue = s
+		return nil
+	}
+	return setWithProperType(fl, fl.field.Type, fl.value, s, clr, false)
 }
 
-func setWithProperType(typ reflect.Type, val reflect.Value, s string, clr color.Color, isSubField bool) error {
+func (fl *flag) set(actualFlagName, s string, clr color.Color) error {
+	fl.isSet = true
+	fl.isAssigned = true
+	fl.actualFlagName = actualFlagName
+	if fl.isNeedDelaySet {
+		fl.lastValue = s
+		return nil
+	}
+	return setWithProperType(fl, fl.field.Type, fl.value, s, clr, false)
+}
+
+func (fl *flag) counterIncr(s string, clr color.Color) error {
+	return setWithProperType(fl, fl.field.Type, fl.value, s, clr, false)
+}
+
+func (fl *flag) isCounter() bool {
+	if decoder := tryGetDecoder(fl.value.Type().Kind(), fl.value); decoder != nil {
+		if _, ok := decoder.(CounterDecoder); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fl *flag) setWithNoDelay(actualFlagName, s string, clr color.Color) error {
+	fl.isSet = true
+	fl.isAssigned = true
+	fl.actualFlagName = actualFlagName
+	return setWithProperType(fl, fl.field.Type, fl.value, s, clr, false)
+}
+
+func tryGetDecoder(kind reflect.Kind, val reflect.Value) Decoder {
+	if val.CanInterface() {
+		var addrVal = val
+		if kind != reflect.Ptr && val.CanAddr() {
+			addrVal = val.Addr()
+		}
+		// try Decoder
+		if addrVal.CanInterface() {
+			if i := addrVal.Interface(); i != nil {
+				if decoder, ok := i.(Decoder); ok {
+					return decoder
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func setWithProperType(fl *flag, typ reflect.Type, val reflect.Value, s string, clr color.Color, isSubField bool) error {
 	kind := typ.Kind()
+
+	// try parser first of all
+	if fl.tag.parserCreator != nil && val.CanInterface() {
+		if kind != reflect.Ptr && val.CanAddr() {
+			val = val.Addr()
+		}
+		return fl.tag.parserCreator(val.Interface()).Parse(s)
+	}
+
+	if decoder := tryGetDecoder(kind, val); decoder != nil {
+		return decoder.Decode(s)
+	}
+
 	switch kind {
 	case reflect.Bool:
 		if v, err := getBool(s, clr); err == nil {
@@ -189,7 +352,7 @@ func setWithProperType(typ reflect.Type, val reflect.Value, s string, clr color.
 
 	case reflect.Slice:
 		if isSubField {
-			return fmt.Errorf("unsupported type %s as sub field type", kind.String())
+			return fmt.Errorf("unsupported type %s as a sub field", kind.String())
 		}
 		sliceOf := typ.Elem()
 		if val.IsNil() {
@@ -207,42 +370,42 @@ func setWithProperType(typ reflect.Type, val reflect.Value, s string, clr color.
 			}
 			val.Set(slice)
 		}
-		return setWithProperType(sliceOf, val.Index(index), s, clr, true)
+		return setWithProperType(fl, sliceOf, val.Index(index), s, clr, true)
 
 	case reflect.Map:
 		if isSubField {
-			return fmt.Errorf("unsupported type %s as sub field type", kind.String())
+			return fmt.Errorf("unsupported type %s as a sub field", kind.String())
 		}
-		ks, vs, err := splitKeyVal(s)
+		keyString, valString, err := splitKeyVal(s, fl.tag.sep)
 		if err != nil {
 			return err
 		}
-		kt := typ.Key()
-		vt := typ.Elem()
+		keyType := typ.Key()
+		valType := typ.Elem()
 		if val.IsNil() {
 			val.Set(reflect.MakeMap(typ))
 		}
-		mk, mv := reflect.New(kt), reflect.New(vt)
-		if err := setWithProperType(kt, mk.Elem(), ks, clr, true); err != nil {
+		k, v := reflect.New(keyType), reflect.New(valType)
+		if err := setWithProperType(fl, keyType, k.Elem(), keyString, clr, true); err != nil {
 			return err
 		}
-		if err := setWithProperType(vt, mv.Elem(), vs, clr, true); err != nil {
+		if err := setWithProperType(fl, valType, v.Elem(), valString, clr, true); err != nil {
 			return err
 		}
-		val.SetMapIndex(mk.Elem(), mv.Elem())
+		val.SetMapIndex(k.Elem(), v.Elem())
 
 	default:
-		return fmt.Errorf("unsupported type of field: %s", kind.String())
+		return fmt.Errorf("unsupported type: %s", kind.String())
 	}
 	return nil
 }
 
-func splitKeyVal(s string) (key, val string, err error) {
+func splitKeyVal(s, sep string) (key, val string, err error) {
 	if s == "" {
 		err = fmt.Errorf("empty key,val pair")
 		return
 	}
-	index := strings.Index(s, "=")
+	index := strings.Index(s, sep)
 	if index == -1 {
 		return s, "", nil
 	}
@@ -288,6 +451,7 @@ func minmaxFloatCheck(kind reflect.Kind, v float64) bool {
 }
 
 func getBool(s string, clr color.Color) (bool, error) {
+	s = strings.ToLower(s)
 	if s == "true" || s == "yes" || s == "y" || s == "" {
 		return true, nil
 	}
@@ -296,7 +460,7 @@ func getBool(s string, clr color.Color) (bool, error) {
 	}
 	i, err := strconv.Atoi(s)
 	if err != nil {
-		return false, fmt.Errorf("`%s` couldn't convert to a %s value", s, clr.Bold("bool"))
+		return false, fmt.Errorf("`%s' couldn't converted to a %s", s, clr.Bold("bool"))
 	}
 	return i != 0, nil
 }
@@ -304,7 +468,7 @@ func getBool(s string, clr color.Color) (bool, error) {
 func getInt(s string, clr color.Color) (int64, error) {
 	i, err := strconv.ParseInt(s, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("`%s` couldn't convert to an %s value", s, clr.Bold("int"))
+		return 0, fmt.Errorf("`%s' couldn't converted to an %s", s, clr.Bold("int"))
 	}
 	return i, nil
 }
@@ -312,7 +476,7 @@ func getInt(s string, clr color.Color) (int64, error) {
 func getUint(s string, clr color.Color) (uint64, error) {
 	i, err := strconv.ParseUint(s, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("`%s` couldn't convert to an %s value", s, clr.Bold("uint"))
+		return 0, fmt.Errorf("`%s' couldn't converted to an %s", s, clr.Bold("uint"))
 	}
 	return i, nil
 }
@@ -320,153 +484,7 @@ func getUint(s string, clr color.Color) (uint64, error) {
 func getFloat(s string, clr color.Color) (float64, error) {
 	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		return 0, fmt.Errorf("`%s` couldn't convert to a %s value", s, clr.Bold("float"))
+		return 0, fmt.Errorf("`%s' couldn't converted to a %s", s, clr.Bold("float"))
 	}
 	return f, nil
-}
-
-// UsageStyle is style of usage
-type UsageStyle int32
-
-const (
-	// NormalStyle : left-right
-	NormalStyle UsageStyle = iota
-	// ManualStyle : up-down
-	ManualStyle
-)
-
-var defaultStyle = NormalStyle
-
-// GetUsageStyle gets default style
-func GetUsageStyle() UsageStyle {
-	return defaultStyle
-}
-
-// SetUsageStyle sets default style
-func SetUsageStyle(style UsageStyle) {
-	defaultStyle = style
-}
-
-type flagSlice []*flag
-
-func (fs flagSlice) String(clr color.Color) string {
-	var (
-		lenShort                 = 0
-		lenLong                  = 0
-		lenNameAndDefaultAndLong = 0
-		lenSep                   = len(sepName)
-		sepSpaces                = strings.Repeat(" ", lenSep)
-	)
-	for _, fl := range fs {
-		tag := fl.tag
-		l := 0
-		for _, shortName := range tag.shortNames {
-			l += len(shortName) + lenSep
-		}
-		if l > lenShort {
-			lenShort = l
-		}
-		l = 0
-		for _, longName := range tag.longNames {
-			l += len(longName) + lenSep
-		}
-		if l > lenLong {
-			lenLong = l
-		}
-		lenDft := 0
-		if tag.defaultValue != "" {
-			lenDft = len(tag.defaultValue) + 3 // 3=len("[=]")
-		}
-		l += lenDft
-		if tag.name != "" {
-			l += len(tag.name) + 1 // 1=len("=")
-		}
-		if l > lenNameAndDefaultAndLong {
-			lenNameAndDefaultAndLong = l
-		}
-	}
-
-	buff := bytes.NewBufferString("")
-	for _, fl := range fs {
-		var (
-			tag         = fl.tag
-			shortStr    = strings.Join(tag.shortNames, sepName)
-			longStr     = strings.Join(tag.longNames, sepName)
-			format      = ""
-			defaultStr  = ""
-			nameStr     = ""
-			usagePrefix = " "
-		)
-		if tag.defaultValue != "" {
-			defaultStr = fmt.Sprintf("[=%s]", tag.defaultValue)
-		}
-		if tag.name != "" {
-			nameStr = "=" + tag.name
-		}
-		if tag.required {
-			usagePrefix = clr.Red("*")
-		}
-		usage := usagePrefix + tag.usage
-
-		spaceSize := lenSep + lenNameAndDefaultAndLong
-		spaceSize -= len(nameStr) + len(defaultStr) + len(longStr)
-
-		if defaultStr != "" {
-			defaultStr = clr.Grey(defaultStr)
-		}
-		if nameStr != "" {
-			nameStr = "=" + clr.Bold(tag.name)
-		}
-
-		if longStr == "" {
-			format = fmt.Sprintf("%%%ds%%s%s%%s", lenShort, sepSpaces)
-			fillStr := fillSpaces(nameStr+defaultStr, spaceSize)
-			fmt.Fprintf(buff, format+"\n", shortStr, fillStr, usage)
-		} else {
-			if shortStr == "" {
-				format = fmt.Sprintf("%%%ds%%s%%s", lenShort+lenSep)
-			} else {
-				format = fmt.Sprintf("%%%ds%s%%s%%s", lenShort, sepName)
-			}
-			fillStr := fillSpaces(longStr+nameStr+defaultStr, spaceSize)
-			fmt.Fprintf(buff, format+"\n", shortStr, fillStr, usage)
-		}
-	}
-	return buff.String()
-}
-
-func fillSpaces(s string, spaceSize int) string {
-	return s + strings.Repeat(" ", spaceSize)
-}
-
-func (fs flagSlice) StringWithStyle(clr color.Color, style UsageStyle) string {
-	if style != ManualStyle {
-		return fs.String(clr)
-	}
-
-	buf := bytes.NewBufferString("")
-	linePrefix := "  "
-	for i, fl := range fs {
-		if i != 0 {
-			buf.WriteString("\n")
-		}
-		names := strings.Join(append(fl.tag.shortNames, fl.tag.longNames...), sepName)
-		buf.WriteString(linePrefix)
-		buf.WriteString(clr.Bold(names))
-		if fl.tag.name != "" {
-			buf.WriteString("=" + clr.Bold(fl.tag.name))
-		}
-		if fl.tag.defaultValue != "" {
-			buf.WriteString(clr.Grey(fmt.Sprintf("[=%s]", fl.tag.defaultValue)))
-		}
-		buf.WriteString("\n")
-		buf.WriteString(linePrefix)
-		buf.WriteString("    ")
-		if fl.tag.required {
-			buf.WriteString(clr.Red("*"))
-		}
-		buf.WriteString(fl.tag.usage)
-		buf.WriteString("\n")
-	}
-	return buf.String()
 }
